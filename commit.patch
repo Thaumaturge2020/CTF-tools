@@ -1,0 +1,227 @@
+diff --git a/Makefile b/Makefile
+index 54666d1..a6ae984 100644
+--- a/Makefile
++++ b/Makefile
+@@ -164,6 +164,7 @@ UPROGS=\
+ 	$U/_zombie\
+ 	$U/_waittest\
+ 	$U/_exittest\
++	$U/_yieldtest\
+ 
+ 
+ ifeq ($(LAB),trap)
+@@ -243,15 +244,8 @@ qemu-gdb: $K/kernel .gdbinit fs.img
+ 	@echo "*** Now run 'gdb' in another window." 1>&2
+ 	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/kernel/defs.h b/kernel/defs.h
+index ecea5e6..b0189ab 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -108,7 +108,7 @@ void            sched(void);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+-int             wait(uint64);
++int             wait(uint64,int);
+ void            wakeup(void*);
+ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 1607145..d954be2 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -181,6 +181,28 @@ uchar initcode[] = {0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02, 0x97, 0x05,
+                     0x20, 0x00, 0x73, 0x00, 0x00, 0x00, 0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e,
+                     0x69, 0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+ 
++void logger_parent(struct proc* server_proc,struct proc* client_proc){
++  switch(client_proc->state){
++    case UNUSED:    exit_info("proc %d exit, parent pid %d, name %s, state unused\n",server_proc->pid,client_proc->pid,client_proc->name);break;
++    case SLEEPING:  exit_info("proc %d exit, parent pid %d, name %s, state sleep\n",server_proc->pid,client_proc->pid,client_proc->name);break;
++    case RUNNING:   exit_info("proc %d exit, parent pid %d, name %s, state run\n",server_proc->pid,client_proc->pid,client_proc->name);break;
++    case RUNNABLE:  exit_info("proc %d exit, parent pid %d, name %s, state runable\n",server_proc->pid,client_proc->pid,client_proc->name);break;
++    case ZOMBIE:    exit_info("proc %d exit, parent pid %d, name %s, state zombie\n",server_proc->pid,client_proc->pid,client_proc->name);break;
++  }
++  return;
++}
++
++void logger_child(struct proc* server_proc,struct proc* client_proc,int child_id){
++  switch(client_proc->state){
++    case UNUSED:    exit_info("proc %d exit, child %d, pid %d, name %s, state unused\n",server_proc->pid,child_id,client_proc->pid,client_proc->name);break;
++    case SLEEPING:  exit_info("proc %d exit, child %d, pid %d, name %s, state sleep\n",server_proc->pid,child_id,client_proc->pid,client_proc->name);break;
++    case RUNNING:   exit_info("proc %d exit, child %d, pid %d, name %s, state run\n",server_proc->pid,child_id,client_proc->pid,client_proc->name);break;
++    case RUNNABLE:  exit_info("proc %d exit, child %d, pid %d, name %s, state runable\n",server_proc->pid,child_id,client_proc->pid,client_proc->name);break;
++    case ZOMBIE:    exit_info("proc %d exit, child %d, pid %d, name %s, state zombie\n",server_proc->pid,child_id,client_proc->pid,client_proc->name);break;
++  }
++  return;
++}
++
+ // Set up first user process.
+ void userinit(void) {
+   struct proc *p;
+@@ -271,7 +293,7 @@ int fork(void) {
+ // Caller must hold p->lock.
+ void reparent(struct proc *p) {
+   struct proc *pp;
+-
++  int cnt = 0;
+   for (pp = proc; pp < &proc[NPROC]; pp++) {
+     // this code uses pp->parent without holding pp->lock.
+     // acquiring the lock first could cause a deadlock
+@@ -282,6 +304,7 @@ void reparent(struct proc *p) {
+       // because only the parent changes it, and we're the parent.
+       acquire(&pp->lock);
+       pp->parent = initproc;
++      logger_child(p,pp,cnt++);
+       // we should wake up init here, but that would require
+       // initproc->lock, which would be a deadlock, since we hold
+       // the lock on one of init's children (pp). this is why
+@@ -338,6 +361,8 @@ void exit(int status) {
+ 
+   acquire(&p->lock);
+ 
++  logger_parent(p,original_parent);
++
+   // Give any children to init.
+   reparent(p);
+ 
+@@ -356,7 +381,8 @@ void exit(int status) {
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+-int wait(uint64 addr) {
++int wait(uint64 addr,int flags) {
++  // exit_info("addr:%d flags:%d\n",addr,flags);
+   struct proc *np;
+   int havekids, pid;
+   struct proc *p = myproc();
+@@ -395,12 +421,13 @@ int wait(uint64 addr) {
+     }
+ 
+     // No point waiting if we don't have any children.
+-    if (!havekids || p->killed) {
++    if (!havekids || p->killed || flags != 0) {
+       release(&p->lock);
+       return -1;
+     }
+ 
+     // Wait for a child to exit.
++    // exit_info("[flags]:%d\n",flags);
+     sleep(p, &p->lock);  // DOC: wait-sleep
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..93d5309 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,3 +104,5 @@ struct proc {
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
+ };
++
++extern struct proc proc[NPROC];
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 4c97875..6c3ca16 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -89,6 +89,7 @@ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
+ extern uint64 sys_rename(void);
++extern uint64 sys_yield(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+     [SYS_fork] sys_fork,   [SYS_exit] sys_exit,     [SYS_wait] sys_wait,     [SYS_pipe] sys_pipe,
+@@ -96,7 +97,7 @@ static uint64 (*syscalls[])(void) = {
+     [SYS_chdir] sys_chdir, [SYS_dup] sys_dup,       [SYS_getpid] sys_getpid, [SYS_sbrk] sys_sbrk,
+     [SYS_sleep] sys_sleep, [SYS_uptime] sys_uptime, [SYS_open] sys_open,     [SYS_write] sys_write,
+     [SYS_mknod] sys_mknod, [SYS_unlink] sys_unlink, [SYS_link] sys_link,     [SYS_mkdir] sys_mkdir,
+-    [SYS_close] sys_close, [SYS_rename] sys_rename,
++    [SYS_close] sys_close, [SYS_rename] sys_rename, [SYS_yield] sys_yield,
+ };
+ 
+ void syscall(void) {
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 6998f87..769a7b1 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_rename 22
++#define SYS_yield 23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index a69071e..3069ef1 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -18,10 +18,10 @@ uint64 sys_getpid(void) { return myproc()->pid; }
+ 
+ uint64 sys_fork(void) { return fork(); }
+ 
+-uint64 sys_wait(void) {
++uint64 sys_wait(int *status,int flags) {
+   uint64 p;
+   if (argaddr(0, &p) < 0) return -1;
+-  return wait(p);
++  return wait(p,flags);
+ }
+ 
+ uint64 sys_sbrk(void) {
+@@ -81,3 +81,20 @@ uint64 sys_rename(void) {
+   p->name[len] = '\0';
+   return 0;
+ }
++
++uint64 sys_yield(void) {
++  struct proc *p = myproc();
++  printf("Save the context of the process to the memory region from address %p to %p\n", &p->context.ra, &p->context.sp + 13);
++  printf("Current running process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
++  for (p = proc; p < &proc[NPROC]; p++){
++      acquire(&p->lock);
++      if (p->state == RUNNABLE){
++        printf("Next runnable process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
++        release(&p->lock);
++        break;
++      }
++      release(&p->lock);
++  }
++  yield();
++  return 0;
++}
+diff --git a/user/user.h b/user/user.h
+index ec47d9d..e052502 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ int rename(const char*);
++void yield(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 3a2f6c4..2918ba2 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -37,3 +37,4 @@ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
+ entry("rename");
++entry("yield");
